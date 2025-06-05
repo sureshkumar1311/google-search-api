@@ -25,6 +25,7 @@ from opentelemetry._logs import (
     get_logger_provider,
     set_logger_provider,
 )
+from googleapiclient.discovery import build
 
 # Set up OpenTelemetry Logger Provider and Azure Monitor exporter
 set_logger_provider(LoggerProvider())
@@ -101,6 +102,7 @@ logger = CustomLoggerAdapter(root_logger, {"correlation_id": correlation_id})
 # pydantic settings
 
 
+# In the Settings class
 class Settings(BaseSettings):
     model_config = ConfigDict(
         env_file=".env",
@@ -112,9 +114,8 @@ class Settings(BaseSettings):
     api_key: str = Field(..., alias='GPT_API_KEY')
     base_url: str = Field(..., alias='GPT_BASE_URL')
     model: str = Field(..., alias='Model')
-    subscription_key: str = Field(..., alias='BingKey')
-    endpoint: str = Field(..., alias='BingEndPoint')
-
+    google_api_key: str = Field(..., alias='GoogleAPIKey')
+    google_search_engine_id: str = Field(..., alias='GoogleSearchEngineID')
 
 class Message(BaseModel):
     role: str
@@ -250,130 +251,102 @@ def error_logging(user_name: str, error_message: str, user_question: str,
             f"Failed to save document:{str(e)}", error_code=500, action_field="ErrorLoggingAPI")
 
 
-class BingSearchTool(BaseTool):
+# Replace BingSearchTool with GoogleSearchTool
+class GoogleSearchTool(BaseTool):
     name: str = "Intermediate Answer"
     description: str = "useful for when you need to answer questions about current events and dates"
 
     def _run(self, query: str) -> str:
-        # os.environ.get("BingKey")
-        subscription_key = os.environ.get("BingKey")
-        
-        endpoint = "https://api.bing.microsoft.com/v7.0/search"
-        mkt = 'en-US'
-        params = {'q': query, 'mkt': mkt}
-        headers = {'Ocp-Apim-Subscription-Key': subscription_key}
-
         try:
-            response = requests.get(endpoint, headers=headers, params=params)
-            logger.info(
-                "API request to the BingSearchTool made.",
-                extra={
+            # Build Google Custom Search API service
+            service = build("customsearch", "v1", developerKey=os.environ.get("GoogleAPIKey"))
+            
+            # Perform the search
+            result = service.cse().list(
+                q=query,
+                cx=os.environ.get("GoogleSearchEngineID"),
+                num=8  # Match similar number of results as before
+            ).execute()
 
-                    "correlation_id": correlation_id,
-                    "action_field": "BingSearchTool"
-                }
-            )
-            logger.debug(
-                f"BingSearchTool response status--{str(response.status_code)}", exc_info=True,
-                extra={
-
-                    "correlation_id": correlation_id,
-                    "action_field": "BingSearchTool"
-                }
-            )
-            response.raise_for_status()
-
-            search_results = response.json().get('webPages', {}).get('value', [])
             result_string = ""
-            for index, result in enumerate(search_results, start=1):
-                if index < 9:
-                    result_string += f"{index}. Topic: {result['name']} \n  Content: {result['snippet']}\n URL: {result['url']}\n\n"
-                else:
-                    break
-            logger.info("BingSearchTool used successfully.",
-                        extra={
+            if 'items' in result:
+                for index, item in enumerate(result['items'], start=1):
+                    if index < 9:
+                        result_string += f"{index}. Topic: {item['title']} \n  Content: {item['snippet']}\n URL: {item['link']}\n\n"
+                    else:
+                        break
 
+            logger.info("GoogleSearchTool used successfully.",
+                        extra={
                             "correlation_id": correlation_id,
-                            "action_field": "BingSearchTool"
-                        }
-                        )
+                            "action_field": "GoogleSearchTool"
+                        })
             return result_string
 
         except Exception as ex:
             logger.exception(
-                f"Encountered an exception in BingSearchTool.", exc_info=True,
+                f"Encountered an exception in GoogleSearchTool.", exc_info=True,
                 extra={
-
                     "correlation_id": correlation_id,
-                    "action_field": "BingSearchToolAPI"
+                    "action_field": "GoogleSearchToolAPI"
                 }
             )
             raise CustomException(
-                f"An error occurred in BingSearchT: {str(ex)}", error_code=500, action_field="BingSearchToolAPI") from ex
+                f"An error occurred in GoogleSearchTool: {str(ex)}", 
+                error_code=500, 
+                action_field="GoogleSearchToolAPI"
+            ) from ex
 
     def _arun(self, query: str) -> str:
-        logger.error("BingSearchTool does not support async processing.", exc_info=True,
-                     extra={
-
-                         "correlation_id": correlation_id,
-                         "action_field": "BingSearchToolRun"
-                     }
-                     )
+        logger.error("GoogleSearchTool does not support async processing.", 
+                    exc_info=True,
+                    extra={
+                        "correlation_id": correlation_id,
+                        "action_field": "GoogleSearchToolRun"
+                    })
         raise CustomException(
-            "'NotImplementedError': BingSearchTool does not support async.", error_code=501, action_field="BingSearchToolRun")
-
+            "'NotImplementedError': GoogleSearchTool does not support async.", 
+            error_code=501, 
+            action_field="GoogleSearchToolRun"
+        )
 
 async def master_search(input_json: str) -> dict:
     try:
-        bingsearch = BingSearchTool()
+        googlesearch = GoogleSearchTool()
         # Validate input parameters using MasterSearchParams
         params = MasterSearchParams(**json.loads(input_json))
 
         search_actions = {
-            'text': lambda: bingsearch.run(params.keywords),
-            'image': lambda: bingsearch.run(params.keywords),
-            'video': lambda: bingsearch.run(params.keywords),
-            'news': lambda: bingsearch.run(params.keywords),
-            # 'map': lambda: bingsearch.run(params.keywords),
-            # 'translate': lambda: bingsearch.run(params.keywords),
-            'suggestions': lambda: bingsearch.run(params.keywords)
+            'text': lambda: googlesearch.run(params.keywords),
+            'image': lambda: googlesearch.run(params.keywords),
+            'video': lambda: googlesearch.run(params.keywords),
+            'news': lambda: googlesearch.run(params.keywords),
+            'suggestions': lambda: googlesearch.run(params.keywords)
         }
 
         if params.operation in search_actions:
             logger.info(
                 "master_search actions done successfully.",
                 extra={
-
                     "correlation_id": correlation_id,
-                    "action_field": "BingSearchMasterSearch"
+                    "action_field": "GoogleSearchMasterSearch"
                 }
             )
             return search_actions[params.operation]()
         else:
             logger.error(
-                "Invalid operation in 'master_search'. Please choose from: 'text', 'image', 'video', 'news', 'suggestions'.", exc_info=True,
+                "Invalid operation in 'master_search'.", 
+                exc_info=True,
                 extra={
-
                     "correlation_id": correlation_id,
-                    "action_field": "BingSearchMasterSearch"
+                    "action_field": "GoogleSearchMasterSearch"
                 }
             )
             raise CustomException(
-                "Invalid operation in 'master_search'. Choose from: 'text', 'image', 'video', 'news', 'suggestions'.", error_code=400, action_field="BingSearchMasterSearch")
-
-    except ValueError as e:
-        logger.exception(
-            f"Validation error in 'master_search'.", exc_info=True,
-            extra={
-
-                "correlation_id": correlation_id,
-                "action_field": "BingSearchMasterSearch"
-            }
-        )
-        # Unprocessable Entity
-        raise CustomException(
-            f"Validation error in 'master_search': {str(e)}", error_code=422, action_field="BingSearchMasterSearch") from e
-
+                "Invalid operation in 'master_search'. Choose from: 'text', 'image', 'video', 'news', 'suggestions'.", 
+                error_code=400, 
+                action_field="GoogleSearchMasterSearch"
+            )
     except Exception as ex:
         logger.exception(
             "Unexpected error in 'master_search'", exc_info=True,
@@ -747,160 +720,103 @@ def get_answer(chat_history: json):
             return response['content'], usage
 
 ##########################################################################################################################
-
 @app.route(route="knowledgeAgent")
 def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
     logger.info(
         'Python HTTP trigger function processed a request.',
         extra={
-
-            "correlation_id": correlation_id,#for tracking insights with unique correlatoin_id.
+            "correlation_id": correlation_id,
             "action_field": "MainCall",
         }
     )
 
     try:
+        # Get and validate request body
         chat_history_json = req.get_json()
-
-    except ValueError as e:
-        logger.error(f"Invalid request format.", exc_info=True,
-                     extra={
-
-                         "correlation_id": correlation_id,
-                         "user_name": None,
-                         "action_field": "MainCall",
-                     }
-                     )
-        error_logging(
-            user_name=None,
-            error_message=str(e),
-            error_status=400,
-            user_question=None,
-            error_description="ValueError",
-            action_field="Invalid JSON format"
-        )
-        return func.HttpResponse(json.dumps({"ValueError": str(e)}), status_code=400)
-    try:
+        if not chat_history_json:
+            raise ValueError("Request body is empty")
 
         chat_history_dict = {"messages": chat_history_json['request_message']}
         user_question = chat_history_json['request_message'][-1]['content']
         user_Details = chat_history_json['user_details']
         user_name = user_Details['username']
 
+        # Validate chat history
         chat_history = ChatHistory(**chat_history_dict)
 
-    except ValidationError as e:
-        logger.error(f"Invalid chat history format.", exc_info=True,
-                     extra={
-
-                         "correlation_id": correlation_id,
-                         "user_name": user_name,
-                         "action_field": "MainCall",
-                     }
-                     )
-        error_logging(
-            user_name=user_name,
-            error_message=str(e),
-            error_status=400,
-            user_question=user_question,
-            error_description="ValidationError",
-            action_field="Invalid Chat History Format"
-        )
-        return func.HttpResponse(json.dumps({"ValidationError": str(e)}), status_code=400)
-
-    try:
+        # Get response from model
         ans, usage = get_answer(chat_history)
-        logger.info(
-            "Returned the response from get_answer() function.",
-            extra={
+        
+        # Validate response
+        if not ans:
+            raise CustomException("Received null response from model", error_code=500)
 
-                "correlation_id": correlation_id,
-                "user_name": user_name,
-                "action_field": "MainCall",
-            }
-        )
-        logger.debug(
-            f"Response from get_answer() function: {ans}", exc_info=True,
-            extra={
+        # Prepare response data
+        response_data = {
+            "role": "assistant",
+            "content": ans,
+            "usage": usage
+        }
 
-                "correlation_id": correlation_id,
-                "user_name": user_name,
-                "action_field": "MainCall",
-            }
-        )
-
+        # Update user details
         user_Details['answer'] = ans
         user_Details['question'] = user_question
         user_Details['usage'] = usage
 
-        #save_document(user_Details)
-        
-        return func.HttpResponse(json.dumps({"role": "assistant", "content": ans, "usage": usage}), status_code=200)
-
-    except CustomException as e:
-        # Log stack trace and use the specific error code from CustomException
-        logger.exception(
-            "CustomException occurred in main while processing request.", exc_info=True,
+        # Log successful response
+        logger.info(
+            "Successfully processed request",
             extra={
-
                 "correlation_id": correlation_id,
                 "user_name": user_name,
-                "action_field": "GetAnswerCallCustomException",
+                "action_field": "MainCall",
+                "response_size": len(ans) if ans else 0
             }
         )
 
-        error_response = {
-            "errorAt": datetime.utcnow().isoformat() + "Z",
-            "role": "assistant",
-            "error_description": str(e),
-            "error_code": e.error_code,
-            'action_field': e.action_field,
-        }
-
-        error_logging(
-            user_name=user_name,
-            error_message=str(e),
-            error_status=e.error_code,
-            user_question=user_question,
-            error_description="CustomException",
-            action_field=e.action_field
+        return func.HttpResponse(
+            body=json.dumps(response_data),
+            mimetype="application/json",
+            status_code=200
         )
 
+    except ValueError as e:
+        error_response = {
+            "role": "assistant",
+            "content": str(e),
+            "error": True,
+            "errorAt": datetime.utcnow().isoformat() + "Z"
+        }
         return func.HttpResponse(
-            json.dumps(error_response),
-            status_code=e.error_code  # Use the specific error code
+            body=json.dumps(error_response),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    except CustomException as e:
+        error_response = {
+            "role": "assistant",
+            "content": str(e),
+            "error": True,
+            "errorAt": datetime.utcnow().isoformat() + "Z",
+            "error_code": e.error_code,
+            "action_field": e.action_field
+        }
+        return func.HttpResponse(
+            body=json.dumps(error_response),
+            mimetype="application/json",
+            status_code=e.error_code
         )
 
     except Exception as e:
-        # Catch any other exceptions that weren't CustomException
-        logger.exception(
-            "Unexpected exception occurred in main.", exc_info=True,
-            extra={
-
-                "correlation_id": correlation_id,
-                "user_name": user_name,
-                "action_field": "GetAnswerCallUnknownException",
-            }
-        )
-
         error_response = {
             "role": "assistant",
-            # "errorAt": datetime.now(datetime.timezone.utc).isoformat() + "Z",
-            "errorAt": datetime.utcnow().isoformat() + "Z",
-            "error_description": str(e),
-            "error_code": 500,
+            "content": f"An unexpected error occurred: {str(e)}",
+            "error": True,
+            "errorAt": datetime.utcnow().isoformat() + "Z"
         }
-
-        error_logging(
-            user_name=user_name,
-            error_message=str(e),
-            error_status=500,
-            user_question=user_question,
-            error_description="UnexpectedError",
-            action_field=None
-        )
-
         return func.HttpResponse(
-            json.dumps(error_response),
+            body=json.dumps(error_response),
+            mimetype="application/json",
             status_code=500
         )
