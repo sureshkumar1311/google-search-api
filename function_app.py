@@ -256,8 +256,8 @@ class BingSearchTool(BaseTool):
 
     def _run(self, query: str) -> str:
         # os.environ.get("BingKey")
-        subscription_key = "abc7c09c41d14f5095a68b2eef4675f1"
-        # os.environ.get("BingEndPoint")
+        subscription_key = os.environ.get("BingKey")
+        
         endpoint = "https://api.bing.microsoft.com/v7.0/search"
         mkt = 'en-US'
         params = {'q': query, 'mkt': mkt}
@@ -754,7 +754,7 @@ def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
         'Python HTTP trigger function processed a request.',
         extra={
 
-            "correlation_id": correlation_id,
+            "correlation_id": correlation_id,#for tracking insights with unique correlatoin_id.
             "action_field": "MainCall",
         }
     )
@@ -833,7 +833,7 @@ def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
         user_Details['question'] = user_question
         user_Details['usage'] = usage
 
-        save_document(user_Details)
+        #save_document(user_Details)
         
         return func.HttpResponse(json.dumps({"role": "assistant", "content": ans, "usage": usage}), status_code=200)
 
