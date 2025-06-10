@@ -7,25 +7,24 @@ import requests
 import time
 import asyncio
 import json
-from typing import Optional
-import logging
-import os
-import backoff
-import openai
 from typing import Optional, List, Dict
 from datetime import datetime
 import uuid
 from azure.monitor.opentelemetry.exporter import AzureMonitorLogExporter
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk._logs import (
-    LoggerProvider,
-    LoggingHandler,
-)
-from opentelemetry._logs import (
-    get_logger_provider,
-    set_logger_provider,
-)
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry._logs import get_logger_provider, set_logger_provider
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import logging
+import os
+import backoff
+import openai
+import contextvars
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# Context variable for correlation ID
+correlation_id_context = contextvars.ContextVar('correlation_id')
 
 # Set up OpenTelemetry Logger Provider and Azure Monitor exporter
 set_logger_provider(LoggerProvider())
@@ -34,24 +33,18 @@ exporter = AzureMonitorLogExporter(
 )
 get_logger_provider().add_log_record_processor(BatchLogRecordProcessor(exporter))
 
-# Configure the root logger directly using basicConfig (better for Azure Functions)
+# Configure the root logger
 logging.basicConfig(level=logging.DEBUG)
-handler = LoggingHandler()  # This handler sends logs to Azure Monitor
+handler = LoggingHandler()
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 root_logger.addHandler(handler)
 
-# Create a correlation ID
-correlation_id = str(uuid.uuid4())
-
-# Custom formatter to include correlation ID and optional fields
-
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
-
 
 class CorrelationFormatter(logging.Formatter):
     def converter(self, timestamp):
-        return time.gmtime(timestamp)  # Use UTC time
+        return time.gmtime(timestamp)
 
     def formatTime(self, record, datefmt=None):
         ct = self.converter(record.created)
@@ -62,17 +55,17 @@ class CorrelationFormatter(logging.Formatter):
         return s
 
     def format(self, record):
-        # Ensure the correlation ID is added if it isn't already set
-        record.correlation_id = getattr(
-            record, 'correlation_id', None) or correlation_id
-
-        # Handle optional fields dynamically
+        # Get correlation ID from context or generate new one
+        try:
+            correlation_id = correlation_id_context.get()
+        except LookupError:
+            correlation_id = str(uuid.uuid4())
+            
+        record.correlation_id = getattr(record, 'correlation_id', None) or correlation_id
         record.user_name = getattr(record, 'user_name', 'N/A')
         record.action_field = getattr(record, 'action_field', 'N/A')
         record.response_time = getattr(record, 'response_time', 'N/A')
-
         return super().format(record)
-
 
 # Add formatter to the handler
 formatter = CorrelationFormatter(
@@ -81,28 +74,41 @@ formatter = CorrelationFormatter(
 )
 handler.setFormatter(formatter)
 
-# Custom LoggerAdapter to ensure extra fields are passed
-
-
 class CustomLoggerAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
-        # Merge extra fields into the log record
         extra = kwargs.get('extra', {})
-        extra['correlation_id'] = self.extra.get(
-            'correlation_id', correlation_id)
+        try:
+            extra['correlation_id'] = self.extra.get('correlation_id', correlation_id_context.get())
+        except LookupError:
+            extra['correlation_id'] = str(uuid.uuid4())
         kwargs['extra'] = extra
         return msg, kwargs
 
-
-# Create a logger adapter that includes the correlation ID
-logger = CustomLoggerAdapter(root_logger, {"correlation_id": correlation_id})
+# Create logger adapter
+logger = CustomLoggerAdapter(root_logger, {})
 
 ###################################################################################################
 
-# pydantic settings
+def validate_environment_variables():
+    """Validate required environment variables at startup"""
+    required_vars = [
+        'GPT_API_VERSION', 'GPT_API_KEY', 'GPT_BASE_URL', 'Model',
+        'GoogleAPIKey', 'GoogleSearchEngineID', 'APP_INSIGHTS_CONN_STRING',
+        'CosmosDBSave', 'CosmosErrorLog'
+    ]
+    
+    missing_vars = [var for var in required_vars if not os.environ.get(var)]
+    if missing_vars:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
+# Validate environment variables at startup
+try:
+    validate_environment_variables()
+except ValueError as e:
+    logger.error(f"Environment validation failed: {e}")
+    raise
 
-# In the Settings class
+# Pydantic settings
 class Settings(BaseSettings):
     model_config = ConfigDict(
         env_file=".env",
@@ -125,12 +131,10 @@ class Message(BaseModel):
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
 
-
 class ChatHistory(BaseModel):
     messages: List[Message]
     name: Optional[str] = None
     question: Optional[str] = None
-
 
 class MasterSearchParams(BaseModel):
     operation: str
@@ -142,16 +146,19 @@ class MasterSearchParams(BaseModel):
 
     @field_validator('operation')
     def validate_operation(cls, v):
-        allowed_operations = {'text', 'image', 'video',
-                              'news', 'suggestions'}
+        allowed_operations = {'text', 'image', 'video', 'news', 'suggestions'}
         if v not in allowed_operations:
             raise ValueError(
                 f"Invalid operation '{v}'. Allowed operations are: {allowed_operations}")
         return v
+    
+    @field_validator('keywords')
+    def validate_keywords_length(cls, v):
+        if len(v) > 50:
+            raise ValueError("Keywords must not exceed 50 characters")
+        return v
 
 #########################################################################################################################
-# custom exception class
-
 
 class CustomException(Exception):
     def __init__(self, message, error_code, action_field=None):
@@ -159,57 +166,51 @@ class CustomException(Exception):
         self.error_code = error_code
         self.action_field = action_field
 
+def log_error_and_raise(message: str, error_code: int, action_field: str, exception: Exception = None):
+    """Helper function to log errors and raise CustomException"""
+    logger.exception(f"{message}", exc_info=True, extra={
+        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+        "action_field": action_field
+    })
+    raise CustomException(message, error_code, action_field) from exception
 
 ######################################################
 
 def save_document(item: json):
     db_url = os.environ.get('CosmosDBSave')
-
-    # Extracting required fields from item
     req_body = item
 
     try:
-        # Sending the POST request
         response = requests.post(db_url, json=req_body)
         logger.debug(
             f"Request initiated to save the document to the database for the id {req_body.get('item_id')}.",
             extra={
-                "correlation_id": correlation_id,
+                "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                 "action_field": "Save Document Helper API."
             }
         )
-        # Raise an exception if the request was unsuccessful
         response.raise_for_status()
 
-        # Return the response JSON data if successful
         logger.info(
             "Request was successfully saved to the database. Returning final response.",
             extra={
-                "correlation_id": correlation_id,
+                "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                 "action_field": "Save Document Helper API."
             }
         )
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        logger.exception(
-            f"An error occurred saving the document to db.", exc_info=True,
-            extra={
-                "correlation_id": correlation_id,
-                "action_field": "Save Document Helper API."
-            }
+        log_error_and_raise(
+            f"An error occurred saving the document to db: {str(e)}", 
+            500, "SaveDocumentAPI", e
         )
-        raise CustomException(
-            f"Failed to save document: {str(e)}", error_code=500, action_field="SaveDocumentAPI")
-
 
 def error_logging(user_name: str, error_message: str, user_question: str,
                   assistant_name: str = 'Knowledge', error_status: int = 500,
                   error_description: str = 'UnexpectedError', action_field=None):
 
     error_log_url = os.environ.get('CosmosErrorLog')
-
-    # Constructing the JSON payload within the function
     req_body = {
         'UserName': user_name,
         'AssistantName': assistant_name,
@@ -221,52 +222,66 @@ def error_logging(user_name: str, error_message: str, user_question: str,
     }
 
     try:
-        # Sending the POST request
         response = requests.post(error_log_url, json=req_body)
-
-        # Raise an exception if the request was unsuccessful
         response.raise_for_status()
         logger.info(
             "Error Log was successfully saved to the database. Returning final response.",
             extra={
-
-                "correlation_id": correlation_id,
+                "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                 "action_field": "Error Logging Helper API"
             }
         )
-        # Return the response JSON data if successful
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        logger.exception(
-            f"An error occurred saving the document to db.", exc_info=True,
-            extra={
-
-                "correlation_id": correlation_id,
-                "action_field": "Error Logging Helper API"
-            }
+        log_error_and_raise(
+            f"Failed to save error log: {str(e)}", 
+            500, "ErrorLoggingAPI", e
         )
-        # Raise an exception with details if the request fails
-        raise CustomException(
-            f"Failed to save document:{str(e)}", error_code=500, action_field="ErrorLoggingAPI")
 
-
-# Replace BingSearchTool with GoogleSearchTool
+# Google Search Tool with retry mechanism
 class GoogleSearchTool(BaseTool):
     name: str = "Intermediate Answer"
     description: str = "useful for when you need to answer questions about current events and dates"
 
-    def _run(self, query: str) -> str:
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((HttpError,))
+    )
+    def _make_search_request(self, service, query: str, search_engine_id: str) -> dict:
+        """Make search request with retry logic for rate limits and quota errors"""
         try:
-            # Build Google Custom Search API service
-            service = build("customsearch", "v1", developerKey=os.environ.get("GoogleAPIKey"))
-            
-            # Perform the search
             result = service.cse().list(
                 q=query,
-                cx=os.environ.get("GoogleSearchEngineID"),
-                num=8  # Match similar number of results as before
+                cx=search_engine_id,
+                num=8
             ).execute()
+            return result
+        except HttpError as e:
+            if e.resp.status in [429, 403]:  # Rate limit or quota exceeded
+                logger.warning(
+                    f"Google Search API rate limit/quota error: {e.resp.status}. Retrying...",
+                    extra={
+                        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+                        "action_field": "GoogleSearchTool"
+                    }
+                )
+                raise  # Re-raise to trigger retry
+            else:
+                # For other HTTP errors, don't retry
+                raise CustomException(
+                    f"Google Search API error: {str(e)}", 
+                    error_code=e.resp.status, 
+                    action_field="GoogleSearchToolAPI"
+                ) from e
+
+    def _run(self, query: str) -> str:
+        try:
+            service = build("customsearch", "v1", developerKey=os.environ.get("GoogleAPIKey"))
+            search_engine_id = os.environ.get("GoogleSearchEngineID")
+            
+            result = self._make_search_request(service, query, search_engine_id)
 
             result_string = ""
             if 'items' in result:
@@ -278,42 +293,29 @@ class GoogleSearchTool(BaseTool):
 
             logger.info("GoogleSearchTool used successfully.",
                         extra={
-                            "correlation_id": correlation_id,
+                            "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                             "action_field": "GoogleSearchTool"
                         })
             return result_string
 
+        except CustomException:
+            raise
         except Exception as ex:
-            logger.exception(
-                f"Encountered an exception in GoogleSearchTool.", exc_info=True,
-                extra={
-                    "correlation_id": correlation_id,
-                    "action_field": "GoogleSearchToolAPI"
-                }
-            )
-            raise CustomException(
+            log_error_and_raise(
                 f"An error occurred in GoogleSearchTool: {str(ex)}", 
-                error_code=500, 
-                action_field="GoogleSearchToolAPI"
-            ) from ex
+                500, "GoogleSearchToolAPI", ex
+            )
 
     def _arun(self, query: str) -> str:
-        logger.error("GoogleSearchTool does not support async processing.", 
-                    exc_info=True,
-                    extra={
-                        "correlation_id": correlation_id,
-                        "action_field": "GoogleSearchToolRun"
-                    })
-        raise CustomException(
+        log_error_and_raise(
             "'NotImplementedError': GoogleSearchTool does not support async.", 
-            error_code=501, 
-            action_field="GoogleSearchToolRun"
+            501, "GoogleSearchToolRun"
         )
 
-async def master_search(input_json: str) -> dict:
+async def master_search(input_json: str) -> Dict[str, str]:
+    """Master search function that returns a dictionary"""
     try:
         googlesearch = GoogleSearchTool()
-        # Validate input parameters using MasterSearchParams
         params = MasterSearchParams(**json.loads(input_json))
 
         search_actions = {
@@ -325,49 +327,36 @@ async def master_search(input_json: str) -> dict:
         }
 
         if params.operation in search_actions:
+            result = search_actions[params.operation]()
             logger.info(
                 "master_search actions done successfully.",
                 extra={
-                    "correlation_id": correlation_id,
+                    "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                     "action_field": "GoogleSearchMasterSearch"
                 }
             )
-            return search_actions[params.operation]()
+            return {"results": result}  # Return dictionary for consistency
         else:
-            logger.error(
-                "Invalid operation in 'master_search'.", 
-                exc_info=True,
-                extra={
-                    "correlation_id": correlation_id,
-                    "action_field": "GoogleSearchMasterSearch"
-                }
-            )
-            raise CustomException(
+            log_error_and_raise(
                 "Invalid operation in 'master_search'. Choose from: 'text', 'image', 'video', 'news', 'suggestions'.", 
-                error_code=400, 
-                action_field="GoogleSearchMasterSearch"
+                400, "GoogleSearchMasterSearch"
             )
-    except Exception as ex:
-        logger.exception(
-            "Unexpected error in 'master_search'", exc_info=True,
-            extra={
-
-                "correlation_id": correlation_id,
-                "action_field": "BingSearchMasterSearch"
-            }
+    except ValidationError as ex:
+        log_error_and_raise(
+            f"Validation error in 'master_search': {str(ex)}", 
+            400, "GoogleSearchMasterSearch", ex
         )
-        # Internal Server Error
-        raise CustomException(
-            f"Unexpected error in 'master_search': {str(ex)}", error_code=500, action_field="BingSearchMasterSearch") from ex
-
-# async wrapper for master_search
-
+    except Exception as ex:
+        log_error_and_raise(
+            f"Unexpected error in 'master_search': {str(ex)}", 
+            500, "GoogleSearchMasterSearch", ex
+        )
 
 async def async_master_search(input_json):
     result = await master_search(input_json)
-    return result
+    return result["results"]  # Extract results string for backward compatibility
 
-# Defining the functions
+# Tool definitions
 tools = [
     {
         "type": "function",
@@ -384,7 +373,7 @@ tools = [
                     },
                     "keywords": {
                         "type": "string",
-                        "description": "The keywords to search for in the specified operation.Maximum keyword should only be 50 "
+                        "description": "The keywords to search for in the specified operation.Maximum keyword should only be 50 characters"
                     },
                     "region": {
                         "type": "string",
@@ -403,20 +392,14 @@ tools = [
         }
     }
 ]
+
 ##########################################################################################################################
-
-# get_completion function with status code-based error handling
-
-# Retry on APIConnectionError and RateLimitError
-
 
 @backoff.on_exception(backoff.expo,
                       (openai.APIConnectionError, openai.RateLimitError),
-                      # Max retry time in seconds (e.g., 5 minutes in seconds)
                       max_time=180,
                       logger=logger)
 def make_openai_api_call(client, messages, settings, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, tools):
-    # This function is wrapped with backoff to handle retry logic
     response = client.chat.completions.create(
         messages=messages,
         model=settings.model,
@@ -429,288 +412,158 @@ def make_openai_api_call(client, messages, settings, temperature, max_tokens, to
         presence_penalty=presence_penalty,
         stop=stop
     )
-    response = response.model_dump()
-    return response
+    return response.model_dump()
 
-
-def get_completion(input_data, tools, temperature=0, max_tokens=4095, top_p=1, frequency_penalty=0, presence_penalty=0, stop=None):
-
+def validate_chat_history(input_data):
+    """Helper function to validate chat history"""
     try:
         if isinstance(input_data, ChatHistory):
             messages = input_data.messages
         elif isinstance(input_data, list):
             messages = input_data
         else:
-            raise ValueError(
-                "Invalid Data Format. Expected ChatHistory or list of Messages object.")
+            raise ValueError("Invalid Data Format. Expected ChatHistory or list of Messages object.")
+        return messages
     except ValidationError as e:
-        logger.error(f"ChatHistory validation error.", exc_info=True,
-                     extra={
-                         "correlation_id": correlation_id,
-                         "action_field": "GetCompletionCall",
-                     }
-                     )
-        raise CustomException("Invalid ChatHistory data.",
-                              error_code=400) from e
+        log_error_and_raise("Invalid ChatHistory data.", 400, "GetCompletionCall", e)
     except Exception as e:
-        logger.error(f"ChatHistory Exception.", exc_info=True,
-                     extra={
+        log_error_and_raise("Invalid ChatHistory data.", 400, "GetCompletionCall", e)
 
-                         "correlation_id": correlation_id,
-                         "action_field": "GetCompletionCall",
-                     }
-                     )
-        raise CustomException("Invalid ChatHistory data.",
-                              error_code=400) from e
+def create_openai_client():
+    """Helper function to create OpenAI client"""
     try:
         settings = Settings()
-        client = AzureOpenAI(api_version=settings.api_version,
-                             api_key=settings.api_key,
-                             base_url=settings.base_url)
+        client = AzureOpenAI(
+            api_version=settings.api_version,
+            api_key=settings.api_key,
+            base_url=settings.base_url
+        )
         logger.info("AzureOpenAI client defined.",
                     extra={
-
-                        "correlation_id": correlation_id,
+                        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                         "action_field": "GetCompletionCall",
-                    }
-                    )
-
+                    })
+        return client, settings
     except ValidationError as e:
-        logger.error(
-            f"OpenAI Configuration validation error.", exc_info=True,
-            extra={
+        log_error_and_raise("OpenAI Configuration validation error.", 500, "GetCompletionCall", e)
 
-                "correlation_id": correlation_id,
-                "action_field": "GetCompletionCall",
-            }
-        )
-        raise CustomException(
-            "OpenAI Configuration validation error.", error_code=500) from e
+def get_completion(input_data, tools, temperature=0, max_tokens=4095, top_p=1, frequency_penalty=0, presence_penalty=0, stop=None):
+    messages = validate_chat_history(input_data)
+    client, settings = create_openai_client()
 
     validated_chat_history = ChatHistory(messages=messages)
     messages = validated_chat_history.model_dump()['messages'] or []
 
     logger.info("Sending completion request to OpenAI API.",
                 extra={
-
-                    "correlation_id": correlation_id,
+                    "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                     "action_field": "GetCompletionCall",
-                }
-                )
-    logger.debug(f"Messages: {messages}", exc_info=True,
+                })
+    
+    logger.debug(f"Messages: {messages}",
                  extra={
-
-                     "correlation_id": correlation_id,
+                     "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                      "action_field": "GetCompletionCall",
-                 }
-                 )
-    logger.debug(f"Functions: {tools}", exc_info=True,
+                 })
+    
+    logger.debug(f"Functions: {tools}",
                  extra={
-
-                     "correlation_id": correlation_id,
+                     "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                      "action_field": "GetCompletionCall",
-                 }
-                 )
+                 })
 
-    # Make API call with retry and backoff logic
     try:
         start_time = time.time()
         response = make_openai_api_call(
-            client, messages, settings, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, tools=tools)
+            client, messages, settings, temperature, max_tokens, top_p, 
+            frequency_penalty, presence_penalty, stop, tools=tools
+        )
         end_time = time.time()
         response_time_ms = (end_time - start_time) * 1000
+        
         logger.info("Received response from OpenAI API.",
                     extra={
-                        "correlation_id": correlation_id,
+                        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                         "action_field": "OpenAIAPICall",
                         "response_time": response_time_ms
-                    }
-                    )
+                    })
         return response['choices'][0]['message'], response['usage']
 
-    except CustomException as e:
+    except CustomException:
         raise
-
     except openai.APIConnectionError as e:
-        logger.exception(f"API Connection Error.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        # Service Unavailable
-        raise CustomException(
-            f"Failed to connect to OpenAI API. {str(e)}", error_code=503) from e
-
+        log_error_and_raise(f"Failed to connect to OpenAI API. {str(e)}", 503, "OpenAIAPICall", e)
     except openai.AuthenticationError as e:
-        logger.exception(f"Authentication Error.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "GetCompletionCall",
-                         }
-                         )
-        raise CustomException(
-            f"Authentication failed.{str(e)}", error_code=401) from e  # Unauthorized
-
+        log_error_and_raise(f"Authentication failed.{str(e)}", 401, "GetCompletionCall", e)
     except openai.RateLimitError as e:
-        logger.exception(f"Rate Limit Exceeded.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        raise CustomException(
-            f"API rate limit exceeded. {str(e)}", error_code=429) from e  # Too Many Requests
-
+        log_error_and_raise(f"API rate limit exceeded. {str(e)}", 429, "OpenAIAPICall", e)
     except openai.APITimeoutError as e:
-        logger.exception(f"Request Timeout.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        raise CustomException(
-            f"Request timed out. {str(e)}", error_code=504) from e  # Gateway Timeout
-
+        log_error_and_raise(f"Request timed out. {str(e)}", 504, "OpenAIAPICall", e)
     except openai.BadRequestError as e:
-        logger.exception(f"Bad Request.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        raise CustomException(
-            f"Bad request, please check parameters. {str(e)}", error_code=400) from e  # Bad Request
-
+        log_error_and_raise(f"Bad request, please check parameters. {str(e)}", 400, "OpenAIAPICall", e)
     except openai.ConflictError as e:
-        logger.exception(f"Conflict Error.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        raise CustomException(
-            f"Resource conflict error. {str(e)}", error_code=409) from e  # Conflict
-
+        log_error_and_raise(f"Resource conflict error. {str(e)}", 409, "OpenAIAPICall", e)
     except openai.InternalServerError as e:
-        logger.exception(
-            f"Internal Server Error.", exc_info=True,
-            extra={
-
-                "correlation_id": correlation_id,
-                "action_field": "OpenAIAPICall",
-            }
-        )
-        # Internal Server Error
-        raise CustomException(
-            f"OpenAI server error. {str(e)}", error_code=500) from e
-
+        log_error_and_raise(f"OpenAI server error. {str(e)}", 500, "OpenAIAPICall", e)
     except openai.NotFoundError as e:
-        logger.exception(f"Not Found.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        raise CustomException(
-            f"Requested resource not found. {str(e)}", error_code=404) from e  # Not Found
-
+        log_error_and_raise(f"Requested resource not found. {str(e)}", 404, "OpenAIAPICall", e)
     except openai.PermissionDeniedError as e:
-        logger.exception(f"Permission Denied.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        raise CustomException(
-            f"Permission denied. {str(e)}", error_code=403) from e  # Forbidden
-
+        log_error_and_raise(f"Permission denied. {str(e)}", 403, "OpenAIAPICall", e)
     except Exception as e:
-        logger.exception(f"Unexpected Error.", exc_info=True,
-                         extra={
-
-                             "correlation_id": correlation_id,
-                             "action_field": "OpenAIAPICall",
-                         }
-                         )
-        # Internal Server Error
-        raise CustomException(
-            f"Unexpected error occurred while using the OpenAI API. {str(e)}", error_code=500) from e
+        log_error_and_raise(f"Unexpected error occurred while using the OpenAI API. {str(e)}", 500, "OpenAIAPICall", e)
 
 ##########################################################################################################################
 
+async def process_tool_calls(response, message):
+    """Helper function to process tool calls"""
+    for tool_call in response['tool_calls']:
+        tool_call_id = tool_call['id']
+        tool_name = tool_call['function']['name']
+        function_response = ""
 
-def get_answer(chat_history: json):
+        try:
+            if tool_name == "master_search":
+                arguments = json.loads(tool_call['function']['arguments'])
+                # Use await instead of asyncio.run()
+                function_response = await async_master_search(json.dumps(arguments))
+
+            message.messages.append(
+                Message(
+                    tool_call_id=tool_call_id,
+                    role="assistant",
+                    name=tool_name,
+                    content=function_response
+                )
+            )
+        except Exception as e:
+            logger.error(f"Error processing tool call {tool_call_id}: {e}")
+            raise
+
+async def get_answer(chat_history: json):
     message = chat_history.model_copy()
+    
     try:
-        response, usage = get_completion(
-            input_data=message, tools=tools)
-    except CustomException as e:
-        raise e
+        response, usage = get_completion(input_data=message, tools=tools)
+    except CustomException:
+        raise
 
-    # Introduce a maximum number of iterations to prevent infinite loops
     MAX_LOOP_ITERATIONS = 15
     iteration_counter = 0
 
     while True:
         iteration_counter += 1
         if iteration_counter > MAX_LOOP_ITERATIONS:
-            logger.error("Exceeded maximum iterations in tool call processing loop.", exc_info=True,
-                         extra={
-                             "correlation_id": correlation_id,
-                             "action_field": "GetAnswerCall: Tool Call Iteration exceeded.",
-                         })
-            raise CustomException(
+            log_error_and_raise(
                 "Exceeded maximum iterations in tool call processing loop.",
-                500,
-                action_field="FunctionToolCall"
+                500, "FunctionToolCall"
             )
 
-        # Assuming 'response' contains the assistant's output with tool_calls
         if response.get('tool_calls'):
-            for tool_call in response['tool_calls']:
-                tool_call_id = tool_call['id']
-                tool_name = tool_call['function']['name']
-                function_response = ""
-
-                try:
-                    # Execute tool call logic based on tool_name
-                    if tool_name == "master_search":
-                        arguments = json.loads(
-                            tool_call['function']['arguments'])
-                        function_response = asyncio.run(
-                            async_master_search(json.dumps(arguments))
-                        )
-
-                    # Append the response message for the tool call
-                    message.messages.append(
-                        Message(
-                            tool_call_id=tool_call_id,
-                            role="assistant",
-                            name=tool_name,
-                            content=function_response
-                        )
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error processing tool call {tool_call_id}: {e}")
-                    raise
-
-            # Regenerate assistant response
-            next_response, usage = get_completion(
-                input_data=message, tools=tools)
+            # Use await since process_tool_calls is now async
+            await process_tool_calls(response, message)
+            next_response, usage = get_completion(input_data=message, tools=tools)
             return next_response['content'], usage
-
         else:
-            # If no tool calls, finalize response
             message.messages.append(
                 Message(
                     role="assistant",
@@ -720,32 +573,69 @@ def get_answer(chat_history: json):
             return response['content'], usage
 
 ##########################################################################################################################
+
+def create_error_response(message: str, status_code: int, error_code: int = None, action_field: str = None):
+    """Helper function to create standardized error responses"""
+    error_response = {
+        "role": "assistant",
+        "content": message,
+        "error": True,
+        "errorAt": datetime.utcnow().isoformat() + "Z"
+    }
+    
+    if error_code:
+        error_response["error_code"] = error_code
+    if action_field:
+        error_response["action_field"] = action_field
+        
+    return func.HttpResponse(
+        body=json.dumps(error_response),
+        mimetype="application/json",
+        status_code=status_code
+    )
+
+def validate_request_body(req: func.HttpRequest):
+    """Helper function to validate request body"""
+    chat_history_json = req.get_json()
+    if not chat_history_json:
+        raise ValueError("Request body is empty")
+    
+    if 'request_message' not in chat_history_json:
+        raise ValueError("Missing 'request_message' in request body")
+    
+    if 'user_details' not in chat_history_json:
+        raise ValueError("Missing 'user_details' in request body")
+    
+    return chat_history_json
+
 @app.route(route="knowledgeAgent")
-def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
+async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
+    # Generate correlation ID for this request
+    request_correlation_id = str(uuid.uuid4())
+    correlation_id_context.set(request_correlation_id)
+    
     logger.info(
         'Python HTTP trigger function processed a request.',
         extra={
-            "correlation_id": correlation_id,
+            "correlation_id": request_correlation_id,
             "action_field": "MainCall",
         }
     )
 
     try:
-        # Get and validate request body
-        chat_history_json = req.get_json()
-        if not chat_history_json:
-            raise ValueError("Request body is empty")
-
+        # Validate request body
+        chat_history_json = validate_request_body(req)
+        
         chat_history_dict = {"messages": chat_history_json['request_message']}
         user_question = chat_history_json['request_message'][-1]['content']
         user_Details = chat_history_json['user_details']
-        user_name = user_Details['username']
+        user_name = user_Details.get('username', 'Unknown')
 
         # Validate chat history
         chat_history = ChatHistory(**chat_history_dict)
 
-        # Get response from model
-        ans, usage = get_answer(chat_history)
+        # Get response from model - use await since get_answer is now async
+        ans, usage = await get_answer(chat_history)
         
         # Validate response
         if not ans:
@@ -767,7 +657,7 @@ def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
         logger.info(
             "Successfully processed request",
             extra={
-                "correlation_id": correlation_id,
+                "correlation_id": request_correlation_id,
                 "user_name": user_name,
                 "action_field": "MainCall",
                 "response_size": len(ans) if ans else 0
@@ -781,42 +671,21 @@ def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except ValueError as e:
-        error_response = {
-            "role": "assistant",
-            "content": str(e),
-            "error": True,
-            "errorAt": datetime.utcnow().isoformat() + "Z"
-        }
-        return func.HttpResponse(
-            body=json.dumps(error_response),
-            mimetype="application/json",
-            status_code=400
-        )
+        return create_error_response(str(e), 400)
 
     except CustomException as e:
-        error_response = {
-            "role": "assistant",
-            "content": str(e),
-            "error": True,
-            "errorAt": datetime.utcnow().isoformat() + "Z",
-            "error_code": e.error_code,
-            "action_field": e.action_field
-        }
-        return func.HttpResponse(
-            body=json.dumps(error_response),
-            mimetype="application/json",
-            status_code=e.error_code
+        return create_error_response(
+            str(e), e.error_code, e.error_code, e.action_field
         )
 
     except Exception as e:
-        error_response = {
-            "role": "assistant",
-            "content": f"An unexpected error occurred: {str(e)}",
-            "error": True,
-            "errorAt": datetime.utcnow().isoformat() + "Z"
-        }
-        return func.HttpResponse(
-            body=json.dumps(error_response),
-            mimetype="application/json",
-            status_code=500
+        logger.exception(
+            f"Unexpected error in knowledgeAgent: {str(e)}",
+            extra={
+                "correlation_id": request_correlation_id,
+                "action_field": "MainCall"
+            }
         )
+        return create_error_response(
+            f"An unexpected error occurred: {str(e)}", 500
+)
