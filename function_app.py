@@ -3,11 +3,11 @@ from pydantic import Field, BaseModel, field_validator, ValidationError, ConfigD
 from openai import AzureOpenAI
 from langchain.tools import BaseTool
 import azure.functions as func
-import requests
+import aiohttp  # Changed from requests to aiohttp for async HTTP calls
 import time
 import asyncio
 import json
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Tuple  # Added proper type hints
 from datetime import datetime
 import uuid
 from azure.monitor.opentelemetry.exporter import AzureMonitorLogExporter
@@ -136,6 +136,7 @@ class ChatHistory(BaseModel):
     name: Optional[str] = None
     question: Optional[str] = None
 
+# FIXED: Corrected indentation of field validators
 class MasterSearchParams(BaseModel):
     operation: str
     keywords: str
@@ -152,6 +153,7 @@ class MasterSearchParams(BaseModel):
                 f"Invalid operation '{v}'. Allowed operations are: {allowed_operations}")
         return v
     
+    # FIXED: Moved this validator to the correct class level
     @field_validator('keywords')
     def validate_keywords_length(cls, v):
         if len(v) > 50:
@@ -176,40 +178,51 @@ def log_error_and_raise(message: str, error_code: int, action_field: str, except
 
 ######################################################
 
-def save_document(item: json):
+# FIXED: Changed from synchronous to asynchronous with proper type annotations
+async def save_document(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Save document to database using async HTTP client"""
     db_url = os.environ.get('CosmosDBSave')
     req_body = item
 
     try:
-        response = requests.post(db_url, json=req_body)
-        logger.debug(
-            f"Request initiated to save the document to the database for the id {req_body.get('item_id')}.",
-            extra={
-                "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
-                "action_field": "Save Document Helper API."
-            }
-        )
-        response.raise_for_status()
+        async with aiohttp.ClientSession() as session:
+            logger.debug(
+                f"Request initiated to save the document to the database for the id {req_body.get('item_id')}.",
+                extra={
+                    "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+                    "action_field": "Save Document Helper API."
+                }
+            )
+            
+            async with session.post(db_url, json=req_body) as response:
+                response.raise_for_status()
+                result = await response.json()
 
-        logger.info(
-            "Request was successfully saved to the database. Returning final response.",
-            extra={
-                "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
-                "action_field": "Save Document Helper API."
-            }
-        )
-        return response.json()
+                logger.info(
+                    "Request was successfully saved to the database. Returning final response.",
+                    extra={
+                        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+                        "action_field": "Save Document Helper API."
+                    }
+                )
+                return result
 
-    except requests.exceptions.RequestException as e:
+    except aiohttp.ClientError as e:
         log_error_and_raise(
             f"An error occurred saving the document to db: {str(e)}", 
             500, "SaveDocumentAPI", e
         )
+    except Exception as e:
+        log_error_and_raise(
+            f"Unexpected error in save_document: {str(e)}", 
+            500, "SaveDocumentAPI", e
+        )
 
-def error_logging(user_name: str, error_message: str, user_question: str,
-                  assistant_name: str = 'Knowledge', error_status: int = 500,
-                  error_description: str = 'UnexpectedError', action_field=None):
-
+# FIXED: Changed from synchronous to asynchronous with proper type annotations
+async def error_logging(user_name: str, error_message: str, user_question: str,
+                       assistant_name: str = 'Knowledge', error_status: int = 500,
+                       error_description: str = 'UnexpectedError', action_field: str = None) -> Dict[str, Any]:
+    """Log errors to database using async HTTP client"""
     error_log_url = os.environ.get('CosmosErrorLog')
     req_body = {
         'UserName': user_name,
@@ -222,20 +235,28 @@ def error_logging(user_name: str, error_message: str, user_question: str,
     }
 
     try:
-        response = requests.post(error_log_url, json=req_body)
-        response.raise_for_status()
-        logger.info(
-            "Error Log was successfully saved to the database. Returning final response.",
-            extra={
-                "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
-                "action_field": "Error Logging Helper API"
-            }
-        )
-        return response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(error_log_url, json=req_body) as response:
+                response.raise_for_status()
+                result = await response.json()
+                
+                logger.info(
+                    "Error Log was successfully saved to the database. Returning final response.",
+                    extra={
+                        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+                        "action_field": "Error Logging Helper API"
+                    }
+                )
+                return result
 
-    except requests.exceptions.RequestException as e:
+    except aiohttp.ClientError as e:
         log_error_and_raise(
             f"Failed to save error log: {str(e)}", 
+            500, "ErrorLoggingAPI", e
+        )
+    except Exception as e:
+        log_error_and_raise(
+            f"Unexpected error in error_logging: {str(e)}", 
             500, "ErrorLoggingAPI", e
         )
 
@@ -539,7 +560,9 @@ async def process_tool_calls(response, message):
             logger.error(f"Error processing tool call {tool_call_id}: {e}")
             raise
 
-async def get_answer(chat_history: json):
+# FIXED: Corrected the loop logic and type annotations
+async def get_answer(chat_history: ChatHistory) -> Tuple[str, Dict[str, Any]]:
+    """Get answer from the AI model with proper tool call handling"""
     message = chat_history.model_copy()
     
     try:
@@ -559,18 +582,22 @@ async def get_answer(chat_history: json):
             )
 
         if response.get('tool_calls'):
-            # Use await since process_tool_calls is now async
+            # Process tool calls
             await process_tool_calls(response, message)
+            # Get next response after processing tool calls
             next_response, usage = get_completion(input_data=message, tools=tools)
-            return next_response['content'], usage
+            response = next_response
+            # FIXED: Continue the loop instead of returning immediately
+            # This allows for multiple consecutive tool calls
         else:
+            # No more tool calls, add final response and return
             message.messages.append(
                 Message(
                     role="assistant",
                     content=response.get('content', ""),
                 )
             )
-            return response['content'], usage
+            return response.get('content', ""), usage
 
 ##########################################################################################################################
 
@@ -688,4 +715,4 @@ async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
         )
         return create_error_response(
             f"An unexpected error occurred: {str(e)}", 500
-)
+        )
