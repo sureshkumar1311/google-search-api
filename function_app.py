@@ -3,11 +3,11 @@ from pydantic import Field, BaseModel, field_validator, ValidationError, ConfigD
 from openai import AzureOpenAI
 from langchain.tools import BaseTool
 import azure.functions as func
-import aiohttp  # Changed from requests to aiohttp for async HTTP calls
+import aiohttp  
 import time
 import asyncio
 import json
-from typing import Optional, List, Dict, Any, Tuple  # Added proper type hints
+from typing import Optional, List, Dict, Any, Tuple  
 from datetime import datetime
 import uuid
 from azure.monitor.opentelemetry.exporter import AzureMonitorLogExporter
@@ -136,7 +136,7 @@ class ChatHistory(BaseModel):
     name: Optional[str] = None
     question: Optional[str] = None
 
-# FIXED: Corrected indentation of field validators
+
 class MasterSearchParams(BaseModel):
     operation: str
     keywords: str
@@ -153,7 +153,7 @@ class MasterSearchParams(BaseModel):
                 f"Invalid operation '{v}'. Allowed operations are: {allowed_operations}")
         return v
     
-    # FIXED: Moved this validator to the correct class level
+    
     @field_validator('keywords')
     def validate_keywords_length(cls, v):
         if len(v) > 50:
@@ -178,7 +178,7 @@ def log_error_and_raise(message: str, error_code: int, action_field: str, except
 
 ######################################################
 
-# FIXED: Changed from synchronous to asynchronous with proper type annotations
+
 async def save_document(item: Dict[str, Any]) -> Dict[str, Any]:
     """Save document to database using async HTTP client"""
     db_url = os.environ.get('CosmosDBSave')
@@ -218,7 +218,7 @@ async def save_document(item: Dict[str, Any]) -> Dict[str, Any]:
             500, "SaveDocumentAPI", e
         )
 
-# FIXED: Changed from synchronous to asynchronous with proper type annotations
+
 async def error_logging(user_name: str, error_message: str, user_question: str,
                        assistant_name: str = 'Knowledge', error_status: int = 500,
                        error_description: str = 'UnexpectedError', action_field: str = None) -> Dict[str, Any]:
@@ -560,7 +560,7 @@ async def process_tool_calls(response, message):
             logger.error(f"Error processing tool call {tool_call_id}: {e}")
             raise
 
-# FIXED: Corrected the loop logic and type annotations
+
 async def get_answer(chat_history: ChatHistory) -> Tuple[str, Dict[str, Any]]:
     """Get answer from the AI model with proper tool call handling"""
     message = chat_history.model_copy()
@@ -587,10 +587,9 @@ async def get_answer(chat_history: ChatHistory) -> Tuple[str, Dict[str, Any]]:
             # Get next response after processing tool calls
             next_response, usage = get_completion(input_data=message, tools=tools)
             response = next_response
-            # FIXED: Continue the loop instead of returning immediately
+            # Continue the loop instead of returning immediately
             # This allows for multiple consecutive tool calls
         else:
-            # No more tool calls, add final response and return
             message.messages.append(
                 Message(
                     role="assistant",
