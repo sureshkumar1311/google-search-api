@@ -260,7 +260,35 @@ async def error_logging(user_name: str, error_message: str, user_question: str,
             500, "ErrorLoggingAPI", e
         )
 
-# Google Search Tool with retry mechanism
+# Async function to make Google Search API request
+async def make_search_request_async(query: str) -> dict:
+    """
+    Wraps the blocking googleapiclient call in asyncio.to_thread for non-blocking behavior.
+    """
+    def sync_search():
+        """
+        This inner function does the actual synchronous call.
+        """
+        try:
+            service = build("customsearch", "v1", developerKey=os.environ.get("GoogleAPIKey"))
+            search_engine_id = os.environ.get("GoogleSearchEngineID")
+            return service.cse().list(
+                q=query,
+                cx=search_engine_id,
+                num=8
+            ).execute()
+        except HttpError as e:
+            if e.resp.status in [429, 403]:  # Re-raise for retry if needed
+                raise
+            else:
+                # Non-retriable HTTP error
+                raise
+
+    # Offload the synchronous call to a separate thread
+    result = await asyncio.to_thread(sync_search)
+    return result
+
+# Google Search Tool with async support
 class GoogleSearchTool(BaseTool):
     name: str = "Intermediate Answer"
     description: str = "useful for when you need to answer questions about current events and dates"
@@ -270,15 +298,57 @@ class GoogleSearchTool(BaseTool):
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type((HttpError,))
     )
-    def _make_search_request(self, service, query: str, search_engine_id: str) -> dict:
-        """Make search request with retry logic for rate limits and quota errors"""
+    async def run_async(self, query: str) -> str:
+        """
+        Asynchronous replacement for the synchronous _run method.
+        Retries the google search up to 3 times on HttpError 429 or 403.
+        """
         try:
+            result = await make_search_request_async(query)
+            result_string = ""
+            if 'items' in result:
+                for index, item in enumerate(result['items'], start=1):
+                    if index < 9:
+                        result_string += (
+                            f"{index}. Topic: {item['title']} \n"
+                            f"  Content: {item['snippet']}\n"
+                            f" URL: {item['link']}\n\n"
+                        )
+            logger.info("GoogleSearchTool used successfully.")
+            return result_string
+        except Exception as ex:
+            logger.exception(f"An error occurred in GoogleSearchTool: {ex}")
+            raise
+
+    def _run(self, query: str) -> str:
+        """
+        Synchronous method for backward compatibility.
+        """
+        try:
+            service = build("customsearch", "v1", developerKey=os.environ.get("GoogleAPIKey"))
+            search_engine_id = os.environ.get("GoogleSearchEngineID")
+            
             result = service.cse().list(
                 q=query,
                 cx=search_engine_id,
                 num=8
             ).execute()
-            return result
+
+            result_string = ""
+            if 'items' in result:
+                for index, item in enumerate(result['items'], start=1):
+                    if index < 9:
+                        result_string += f"{index}. Topic: {item['title']} \n  Content: {item['snippet']}\n URL: {item['link']}\n\n"
+                    else:
+                        break
+
+            logger.info("GoogleSearchTool used successfully.",
+                        extra={
+                            "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+                            "action_field": "GoogleSearchTool"
+                        })
+            return result_string
+
         except HttpError as e:
             if e.resp.status in [429, 403]:  # Rate limit or quota exceeded
                 logger.warning(
@@ -296,31 +366,6 @@ class GoogleSearchTool(BaseTool):
                     error_code=e.resp.status, 
                     action_field="GoogleSearchToolAPI"
                 ) from e
-
-    def _run(self, query: str) -> str:
-        try:
-            service = build("customsearch", "v1", developerKey=os.environ.get("GoogleAPIKey"))
-            search_engine_id = os.environ.get("GoogleSearchEngineID")
-            
-            result = self._make_search_request(service, query, search_engine_id)
-
-            result_string = ""
-            if 'items' in result:
-                for index, item in enumerate(result['items'], start=1):
-                    if index < 9:
-                        result_string += f"{index}. Topic: {item['title']} \n  Content: {item['snippet']}\n URL: {item['link']}\n\n"
-                    else:
-                        break
-
-            logger.info("GoogleSearchTool used successfully.",
-                        extra={
-                            "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
-                            "action_field": "GoogleSearchTool"
-                        })
-            return result_string
-
-        except CustomException:
-            raise
         except Exception as ex:
             log_error_and_raise(
                 f"An error occurred in GoogleSearchTool: {str(ex)}", 
@@ -339,29 +384,18 @@ async def master_search(input_json: str) -> Dict[str, str]:
         googlesearch = GoogleSearchTool()
         params = MasterSearchParams(**json.loads(input_json))
 
-        search_actions = {
-            'text': lambda: googlesearch.run(params.keywords),
-            'image': lambda: googlesearch.run(params.keywords),
-            'video': lambda: googlesearch.run(params.keywords),
-            'news': lambda: googlesearch.run(params.keywords),
-            'suggestions': lambda: googlesearch.run(params.keywords)
-        }
-
-        if params.operation in search_actions:
-            result = search_actions[params.operation]()
-            logger.info(
-                "master_search actions done successfully.",
-                extra={
-                    "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
-                    "action_field": "GoogleSearchMasterSearch"
-                }
-            )
-            return {"results": result}  # Return dictionary for consistency
-        else:
-            log_error_and_raise(
-                "Invalid operation in 'master_search'. Choose from: 'text', 'image', 'video', 'news', 'suggestions'.", 
-                400, "GoogleSearchMasterSearch"
-            )
+        # Use the async method instead of the sync one
+        result = await googlesearch.run_async(params.keywords)
+        
+        logger.info(
+            "master_search actions done successfully.",
+            extra={
+                "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+                "action_field": "GoogleSearchMasterSearch"
+            }
+        )
+        return {"results": result}  # Return dictionary for consistency
+        
     except ValidationError as ex:
         log_error_and_raise(
             f"Validation error in 'master_search': {str(ex)}", 
