@@ -738,6 +738,8 @@ async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
         user_Details['question'] = user_question
         user_Details['usage'] = usage
 
+        await save_document(user_Details)
+
         # Log successful response
         logger.info(
             "Successfully processed request",
