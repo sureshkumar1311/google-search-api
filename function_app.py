@@ -261,7 +261,7 @@ async def error_logging(user_name: str, error_message: str, user_question: str,
         )
 
 # Async function to make Google Search API request
-async def make_search_request_async(query: str) -> dict:
+async def make_search_request_async(query: str, max_results: int = 8) -> dict:
     """
     Wraps the blocking googleapiclient call in asyncio.to_thread for non-blocking behavior.
     """
@@ -275,7 +275,7 @@ async def make_search_request_async(query: str) -> dict:
             return service.cse().list(
                 q=query,
                 cx=search_engine_id,
-                num=8
+                num=min(max_results, 10)
             ).execute()
         except HttpError as e:
             if e.resp.status in [429, 403]:  # Re-raise for retry if needed
@@ -298,21 +298,21 @@ class GoogleSearchTool(BaseTool):
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type((HttpError,))
     )
-    async def run_async(self, query: str) -> str:
+    async def run_async(self, query: str, max_results: int = 8) -> str:
         """
         Asynchronous replacement for the synchronous _run method.
         Retries the google search up to 3 times on HttpError 429 or 403.
         """
         try:
-            result = await make_search_request_async(query)
+            result = await make_search_request_async(query, max_results)
             result_string = ""
             if 'items' in result:
                 for index, item in enumerate(result['items'], start=1):
-                    if index < 9:
+                    if index <= max_results:
                         result_string += (
                             f"{index}. Topic: {item['title']} \n"
                             f"  Content: {item['snippet']}\n"
-                            f" URL: {item['link']}\n\n"
+                            f"  URL: {item['link']}\n\n"
                         )
             logger.info("GoogleSearchTool used successfully.")
             return result_string
@@ -338,7 +338,7 @@ class GoogleSearchTool(BaseTool):
             if 'items' in result:
                 for index, item in enumerate(result['items'], start=1):
                     if index < 9:
-                        result_string += f"{index}. Topic: {item['title']} \n  Content: {item['snippet']}\n URL: {item['link']}\n\n"
+                        result_string += f"{index}. Topic: {item['title']} \n  Content: {item['snippet']}\n  URL: {item['link']}\n\n"
                     else:
                         break
 
@@ -372,29 +372,54 @@ class GoogleSearchTool(BaseTool):
                 500, "GoogleSearchToolAPI", ex
             )
 
-    def _arun(self, query: str) -> str:
-        log_error_and_raise(
-            "'NotImplementedError': GoogleSearchTool does not support async.", 
-            501, "GoogleSearchToolRun"
-        )
+    #Properly implement the async _arun method to avoid inconsistency
+    async def _arun(self, query: str) -> str:
+        """
+        Properly implement the async _arun method by calling run_async.
+        This ensures consistency and allows the tool to work in async-only contexts.
+        """
+        return await self.run_async(query)
 
 async def master_search(input_json: str) -> Dict[str, str]:
-    """Master search function that returns a dictionary"""
+    """
+    Master search function that returns a dictionary.
+    Handle different operations and use all parameters from MasterSearchParams.
+    """
     try:
         googlesearch = GoogleSearchTool()
         params = MasterSearchParams(**json.loads(input_json))
 
-        # Use the async method instead of the sync one
-        result = await googlesearch.run_async(params.keywords)
+        # Handle different operations here (text vs. image vs. others).
+        # Use all parameters including operation, max_results, etc.
+        search_query = params.keywords
         
+        if params.operation == "text":
+            # Standard text search
+            result = await googlesearch.run_async(search_query, params.max_results or 8)
+        elif params.operation == "image":
+            # Image search - modify query to include image search context
+            result = await googlesearch.run_async(f"{search_query} images", params.max_results or 8)
+        elif params.operation == "video":
+            # Video search - modify query to include video search context
+            result = await googlesearch.run_async(f"{search_query} videos", params.max_results or 8)
+        elif params.operation == "news":
+            # News search - modify query to include news search context
+            result = await googlesearch.run_async(f"{search_query} news", params.max_results or 8)
+        elif params.operation == "suggestions":
+            # Suggestions search - modify query to get related suggestions
+            result = await googlesearch.run_async(f"{search_query} related suggestions", params.max_results or 8)
+        else:
+            # Fallback for any other operations
+            result = await googlesearch.run_async(f"{search_query} {params.operation}", params.max_results or 8)
+
         logger.info(
-            "master_search actions done successfully.",
+            f"master_search actions done successfully for operation: {params.operation}",
             extra={
                 "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
                 "action_field": "GoogleSearchMasterSearch"
             }
         )
-        return {"results": result}  # Return dictionary for consistency
+        return {"results": result}
         
     except ValidationError as ex:
         log_error_and_raise(
