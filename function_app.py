@@ -18,7 +18,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import logging
 import os
-import backoff
 import openai
 import contextvars
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -140,10 +139,8 @@ class ChatHistory(BaseModel):
 class MasterSearchParams(BaseModel):
     operation: str
     keywords: str
-    region: Optional[str] = 'wt-wt'
     max_results: Optional[int] = 5
     to_lang: Optional[str] = 'en'
-    place: Optional[str] = None
 
     @field_validator('operation')
     def validate_operation(cls, v):
@@ -152,7 +149,6 @@ class MasterSearchParams(BaseModel):
             raise ValueError(
                 f"Invalid operation '{v}'. Allowed operations are: {allowed_operations}")
         return v
-    
     
     @field_validator('keywords')
     def validate_keywords_length(cls, v):
@@ -170,12 +166,17 @@ class CustomException(Exception):
 
 def log_error_and_raise(message: str, error_code: int, action_field: str, exception: Exception = None):
     """Helper function to log errors and raise CustomException"""
-    logger.exception(f"{message}", exc_info=True, extra={
-        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
-        "action_field": action_field
-    })
+    if exception:
+        logger.exception(f"{message}: {str(exception)}", exc_info=True, extra={
+            "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+            "action_field": action_field
+        })
+    else:
+        logger.error(f"{message}", extra={
+            "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
+            "action_field": action_field
+        })
     raise CustomException(message, error_code, action_field) from exception
-
 ######################################################
 
 
@@ -207,16 +208,18 @@ async def save_document(item: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 return result
 
+    except aiohttp.ClientResponseError as e:
+        log_error_and_raise("HTTP error occurred while saving the document", 502, "SaveDocumentAPI", e)
+
+    except aiohttp.ClientConnectionError as e:
+        log_error_and_raise("Connection error while saving the document", 504, "SaveDocumentAPI", e)
+
     except aiohttp.ClientError as e:
-        log_error_and_raise(
-            f"An error occurred saving the document to db: {str(e)}", 
-            500, "SaveDocumentAPI", e
-        )
+        log_error_and_raise("AIOHTTP client error while saving the document", 500, "SaveDocumentAPI", e)
+
     except Exception as e:
-        log_error_and_raise(
-            f"Unexpected error in save_document: {str(e)}", 
-            500, "SaveDocumentAPI", e
-        )
+        log_error_and_raise("Unexpected error in save_document", 500, "SaveDocumentAPI", e)
+
 
 
 async def error_logging(user_name: str, error_message: str, user_question: str,
@@ -251,12 +254,12 @@ async def error_logging(user_name: str, error_message: str, user_question: str,
 
     except aiohttp.ClientError as e:
         log_error_and_raise(
-            f"Failed to save error log: {str(e)}", 
+            f"Failed to save error log", 
             500, "ErrorLoggingAPI", e
         )
     except Exception as e:
         log_error_and_raise(
-            f"Unexpected error in error_logging: {str(e)}", 
+            f"Unexpected error in error_logging", 
             500, "ErrorLoggingAPI", e
         )
 
@@ -296,7 +299,7 @@ class GoogleSearchTool(BaseTool):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((HttpError,))
+        retry=retry_if_exception_type((openai.APIConnectionError, openai.RateLimitError))
     )
     async def run_async(self, query: str, max_results: int = 8) -> str:
         """
@@ -317,8 +320,12 @@ class GoogleSearchTool(BaseTool):
             logger.info("GoogleSearchTool used successfully.")
             return result_string
         except Exception as ex:
-            logger.exception(f"An error occurred in GoogleSearchTool: {ex}")
-            raise
+            log_error_and_raise(
+                "An error occurred in GoogleSearchTool",
+                500,
+                "GoogleSearchToolAPI",
+                ex
+            )
 
     def _run(self, query: str) -> str:
         """
@@ -362,13 +369,13 @@ class GoogleSearchTool(BaseTool):
             else:
                 # For other HTTP errors, don't retry
                 raise CustomException(
-                    f"Google Search API error: {str(e)}", 
+                    f"Google Search API error", 
                     error_code=e.resp.status, 
                     action_field="GoogleSearchToolAPI"
                 ) from e
         except Exception as ex:
             log_error_and_raise(
-                f"An error occurred in GoogleSearchTool: {str(ex)}", 
+                f"An error occurred in GoogleSearchTool", 
                 500, "GoogleSearchToolAPI", ex
             )
 
@@ -423,12 +430,17 @@ async def master_search(input_json: str) -> Dict[str, str]:
         
     except ValidationError as ex:
         log_error_and_raise(
-            f"Validation error in 'master_search': {str(ex)}", 
+            f"Validation error in 'master_search'", 
+            400, "GoogleSearchMasterSearch", ex
+        )
+    except json.JSONDecodeError as ex:
+        log_error_and_raise(
+            f"JSON decode error in 'master_search'", 
             400, "GoogleSearchMasterSearch", ex
         )
     except Exception as ex:
         log_error_and_raise(
-            f"Unexpected error in 'master_search': {str(ex)}", 
+            f"Unexpected error in 'master_search'", 
             500, "GoogleSearchMasterSearch", ex
         )
 
@@ -455,13 +467,9 @@ tools = [
                         "type": "string",
                         "description": "The keywords to search for in the specified operation.Maximum keyword should only be 50 characters"
                     },
-                    "region": {
-                        "type": "string",
-                        "description": "Optional. The region to perform the search in. Defaults to 'wt-wt'."
-                    },
                     "max_results": {
                         "type": "integer",
-                        "description": "Optional. The maximum number of results to return. If not provided, all results will be returned."
+                        "description": "Optional. The maximum number of results to return. If not provided, default will be used."
                     }
                 },
                 "required": [
@@ -475,24 +483,27 @@ tools = [
 
 ##########################################################################################################################
 
-@backoff.on_exception(backoff.expo,
-                      (openai.APIConnectionError, openai.RateLimitError),
-                      max_time=180,
-                      logger=logger)
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((openai.APIConnectionError, openai.RateLimitError))
+)
 def make_openai_api_call(client, messages, settings, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, tools):
-    response = client.chat.completions.create(
-        messages=messages,
-        model=settings.model,
-        tools=tools,
-        tool_choice="auto",
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        frequency_penalty=frequency_penalty,
-        presence_penalty=presence_penalty,
-        stop=stop
-    )
-    return response.model_dump()
+    try:
+        return client.chat.completions.create(
+            messages=messages,
+            model=settings.model,
+            tools=tools,
+            tool_choice="auto",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            stop=stop
+        ).model_dump()
+    except openai.OpenAIError as e:
+        raise e  # Will be retried by tenacity
 
 def validate_chat_history(input_data):
     """Helper function to validate chat history"""
@@ -615,13 +626,43 @@ async def process_tool_calls(response, message):
                     content=function_response
                 )
             )
-        except Exception as e:
-            logger.error(f"Error processing tool call {tool_call_id}: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON in tool call {tool_call_id}: {e}")
+            raise CustomException(
+                "Invalid JSON in tool call arguments",
+                400,
+                "ToolCallProcessing"
+            ) from e
+        except ValidationError as e:
+            logger.error(f"Validation error in tool call {tool_call_id}: {e}")
+            raise CustomException(
+                "Invalid tool call arguments",
+                400,
+                "ToolCallProcessing"
+            ) from e
+        except CustomException:
             raise
-
+        except Exception as e:
+            logger.error(f"Unexpected error processing tool call {tool_call_id}: {e}")
+            raise CustomException(
+                "Unexpected error processing tool call",
+                500,
+                "ToolCallProcessing"
+            ) from e
 
 async def get_answer(chat_history: ChatHistory) -> Tuple[str, Dict[str, Any]]:
-    """Get answer from the AI model with proper tool call handling"""
+    """
+    Get answer from the AI model with proper tool call handling.
+    
+    Args:
+        chat_history (ChatHistory): The conversation history containing messages
+        
+    Returns:
+        Tuple[str, Dict[str, Any]]: A tuple containing the AI response content and usage statistics
+        
+    Raises:
+        CustomException: If there's an error in processing or if maximum iterations are exceeded
+    """
     message = chat_history.model_copy()
     
     try:
@@ -695,6 +736,26 @@ def validate_request_body(req: func.HttpRequest):
 
 @app.route(route="knowledgeAgent")
 async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Azure Function HTTP trigger for the Knowledge Agent.
+    
+    Processes chat requests, handles tool calls, and returns AI-generated responses.
+    
+    Args:
+        req (func.HttpRequest): The HTTP request containing chat history and user details
+        
+    Returns:
+        func.HttpResponse: JSON response containing the AI assistant's reply and usage statistics
+        
+    Expected Request Body:
+        {
+            "request_message": [{"role": "user", "content": "question"}],
+            "user_details": {"username": "user", ...}
+        }
+        
+    Raises:
+        Returns error responses for validation errors, processing errors, or unexpected exceptions
+    """
     # Generate correlation ID for this request
     request_correlation_id = str(uuid.uuid4())
     correlation_id_context.set(request_correlation_id)
@@ -738,7 +799,7 @@ async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
         user_Details['question'] = user_question
         user_Details['usage'] = usage
 
-        await save_document(user_Details)
+        #await save_document(user_Details)
 
         # Log successful response
         logger.info(
