@@ -210,14 +210,14 @@ async def save_document(item: Dict[str, Any]) -> Dict[str, Any]:
 
     except aiohttp.ClientResponseError as e:
         log_error_and_raise("HTTP error occurred while saving the document", 502, "SaveDocumentAPI", e)
-
     except aiohttp.ClientConnectionError as e:
         log_error_and_raise("Connection error while saving the document", 504, "SaveDocumentAPI", e)
-
     except aiohttp.ClientError as e:
         log_error_and_raise("AIOHTTP client error while saving the document", 500, "SaveDocumentAPI", e)
-
+    except (ValueError, TypeError, KeyError) as e:
+        log_error_and_raise("Invalid data format while saving the document", 400, "SaveDocumentAPI", e)
     except Exception as e:
+        # Catch-all for any other unexpected errors
         log_error_and_raise("Unexpected error in save_document", 500, "SaveDocumentAPI", e)
 
 
@@ -252,16 +252,17 @@ async def error_logging(user_name: str, error_message: str, user_question: str,
                 )
                 return result
 
+    except aiohttp.ClientResponseError as e:
+        log_error_and_raise("HTTP error occurred while logging error", 502, "ErrorLoggingAPI", e)
+    except aiohttp.ClientConnectionError as e:
+        log_error_and_raise("Connection error while logging error", 504, "ErrorLoggingAPI", e)
     except aiohttp.ClientError as e:
-        log_error_and_raise(
-            f"Failed to save error log", 
-            500, "ErrorLoggingAPI", e
-        )
+        log_error_and_raise("AIOHTTP client error while logging error", 500, "ErrorLoggingAPI", e)
+    except (ValueError, TypeError, KeyError) as e:
+        log_error_and_raise("Invalid data format while logging error", 400, "ErrorLoggingAPI", e)
     except Exception as e:
-        log_error_and_raise(
-            f"Unexpected error in error_logging", 
-            500, "ErrorLoggingAPI", e
-        )
+        # Catch-all for any other unexpected errors
+        log_error_and_raise("Unexpected error in error_logging", 500, "ErrorLoggingAPI", e)
 
 # Async function to make Google Search API request
 async def make_search_request_async(query: str, max_results: int = 8) -> dict:
@@ -319,13 +320,16 @@ class GoogleSearchTool(BaseTool):
                         )
             logger.info("GoogleSearchTool used successfully.")
             return result_string
-        except Exception as ex:
-            log_error_and_raise(
-                "An error occurred in GoogleSearchTool",
-                500,
-                "GoogleSearchToolAPI",
-                ex
-            )
+        except HttpError as e:
+            if e.resp.status in [429, 403]:  # Rate limit or quota exceeded
+                log_error_and_raise("Google Search API rate limit/quota exceeded", e.resp.status, "GoogleSearchToolAPI", e)
+            else:
+                log_error_and_raise("Google Search API HTTP error", e.resp.status, "GoogleSearchToolAPI", e)
+        except (ValueError, TypeError, KeyError) as e:
+            log_error_and_raise("Invalid data format in GoogleSearchTool", 400, "GoogleSearchToolAPI", e)
+        except Exception as e:
+            # Catch-all for any other unexpected errors
+            log_error_and_raise("Unexpected error in GoogleSearchTool", 500, "GoogleSearchToolAPI", e)
 
     def _run(self, query: str) -> str:
         """
@@ -358,26 +362,14 @@ class GoogleSearchTool(BaseTool):
 
         except HttpError as e:
             if e.resp.status in [429, 403]:  # Rate limit or quota exceeded
-                logger.warning(
-                    f"Google Search API rate limit/quota error: {e.resp.status}. Retrying...",
-                    extra={
-                        "correlation_id": correlation_id_context.get(str(uuid.uuid4())),
-                        "action_field": "GoogleSearchTool"
-                    }
-                )
-                raise  # Re-raise to trigger retry
+                log_error_and_raise("Google Search API rate limit/quota exceeded", e.resp.status, "GoogleSearchToolAPI", e)
             else:
-                # For other HTTP errors, don't retry
-                raise CustomException(
-                    f"Google Search API error", 
-                    error_code=e.resp.status, 
-                    action_field="GoogleSearchToolAPI"
-                ) from e
-        except Exception as ex:
-            log_error_and_raise(
-                f"An error occurred in GoogleSearchTool", 
-                500, "GoogleSearchToolAPI", ex
-            )
+                log_error_and_raise("Google Search API HTTP error", e.resp.status, "GoogleSearchToolAPI", e)
+        except (ValueError, TypeError, KeyError) as e:
+            log_error_and_raise("Invalid data format in GoogleSearchTool", 400, "GoogleSearchToolAPI", e)
+        except Exception as e:
+            # Catch-all for any other unexpected errors
+            log_error_and_raise("Unexpected error in GoogleSearchTool", 500, "GoogleSearchToolAPI", e)
 
     #Properly implement the async _arun method to avoid inconsistency
     async def _arun(self, query: str) -> str:
@@ -428,21 +420,15 @@ async def master_search(input_json: str) -> Dict[str, str]:
         )
         return {"results": result}
         
-    except ValidationError as ex:
-        log_error_and_raise(
-            f"Validation error in 'master_search'", 
-            400, "GoogleSearchMasterSearch", ex
-        )
-    except json.JSONDecodeError as ex:
-        log_error_and_raise(
-            f"JSON decode error in 'master_search'", 
-            400, "GoogleSearchMasterSearch", ex
-        )
-    except Exception as ex:
-        log_error_and_raise(
-            f"Unexpected error in 'master_search'", 
-            500, "GoogleSearchMasterSearch", ex
-        )
+    except ValidationError as e:
+        log_error_and_raise("Validation error in 'master_search'", 400, "GoogleSearchMasterSearch", e)
+    except json.JSONDecodeError as e:
+        log_error_and_raise("JSON decode error in 'master_search'", 400, "GoogleSearchMasterSearch", e)
+    except (ValueError, TypeError, KeyError) as e:
+        log_error_and_raise("Invalid data format in 'master_search'", 400, "GoogleSearchMasterSearch", e)
+    except Exception as e:
+        # Catch-all for any other unexpected errors
+        log_error_and_raise("Unexpected error in 'master_search'", 500, "GoogleSearchMasterSearch", e)
 
 async def async_master_search(input_json):
     result = await master_search(input_json)
@@ -516,9 +502,12 @@ def validate_chat_history(input_data):
             raise ValueError("Invalid Data Format. Expected ChatHistory or list of Messages object.")
         return messages
     except ValidationError as e:
-        log_error_and_raise("Invalid ChatHistory data.", 400, "GetCompletionCall", e)
+        log_error_and_raise("Invalid ChatHistory data format", 400, "GetCompletionCall", e)
+    except (ValueError, TypeError) as e:
+        log_error_and_raise("Invalid ChatHistory data", 400, "GetCompletionCall", e)
     except Exception as e:
-        log_error_and_raise("Invalid ChatHistory data.", 400, "GetCompletionCall", e)
+        # Catch-all for any other unexpected errors
+        log_error_and_raise("Unexpected error validating ChatHistory", 500, "GetCompletionCall", e)
 
 def create_openai_client():
     """Helper function to create OpenAI client"""
@@ -536,7 +525,12 @@ def create_openai_client():
                     })
         return client, settings
     except ValidationError as e:
-        log_error_and_raise("OpenAI Configuration validation error.", 500, "GetCompletionCall", e)
+        log_error_and_raise("OpenAI Configuration validation error", 500, "GetCompletionCall", e)
+    except (ValueError, TypeError) as e:
+        log_error_and_raise("Invalid OpenAI configuration", 500, "GetCompletionCall", e)
+    except Exception as e:
+        # Catch-all for any other unexpected errors
+        log_error_and_raise("Unexpected error creating OpenAI client", 500, "GetCompletionCall", e)
 
 def get_completion(input_data, tools, temperature=0, max_tokens=4095, top_p=1, frequency_penalty=0, presence_penalty=0, stop=None):
     messages = validate_chat_history(input_data)
@@ -627,28 +621,16 @@ async def process_tool_calls(response, message):
                 )
             )
         except json.JSONDecodeError as e:
-            logger.error(f"Error decoding JSON in tool call {tool_call_id}: {e}")
-            raise CustomException(
-                "Invalid JSON in tool call arguments",
-                400,
-                "ToolCallProcessing"
-            ) from e
+            log_error_and_raise("Invalid JSON in tool call arguments", 400, "ToolCallProcessing", e)
         except ValidationError as e:
-            logger.error(f"Validation error in tool call {tool_call_id}: {e}")
-            raise CustomException(
-                "Invalid tool call arguments",
-                400,
-                "ToolCallProcessing"
-            ) from e
+            log_error_and_raise("Invalid tool call arguments", 400, "ToolCallProcessing", e)
         except CustomException:
             raise
+        except (ValueError, TypeError, KeyError) as e:
+            log_error_and_raise("Invalid data format in tool call processing", 400, "ToolCallProcessing", e)
         except Exception as e:
-            logger.error(f"Unexpected error processing tool call {tool_call_id}: {e}")
-            raise CustomException(
-                "Unexpected error processing tool call",
-                500,
-                "ToolCallProcessing"
-            ) from e
+            # Catch-all for any other unexpected errors
+            log_error_and_raise("Unexpected error processing tool call", 500, "ToolCallProcessing", e)
 
 async def get_answer(chat_history: ChatHistory) -> Tuple[str, Dict[str, Any]]:
     """
@@ -722,17 +704,26 @@ def create_error_response(message: str, status_code: int, error_code: int = None
 
 def validate_request_body(req: func.HttpRequest):
     """Helper function to validate request body"""
-    chat_history_json = req.get_json()
-    if not chat_history_json:
-        raise ValueError("Request body is empty")
-    
-    if 'request_message' not in chat_history_json:
-        raise ValueError("Missing 'request_message' in request body")
-    
-    if 'user_details' not in chat_history_json:
-        raise ValueError("Missing 'user_details' in request body")
-    
-    return chat_history_json
+    try:
+        chat_history_json = req.get_json()
+        if not chat_history_json:
+            raise ValueError("Request body is empty")
+        
+        if 'request_message' not in chat_history_json:
+            raise ValueError("Missing 'request_message' in request body")
+        
+        if 'user_details' not in chat_history_json:
+            raise ValueError("Missing 'user_details' in request body")
+        
+        return chat_history_json
+    except ValueError as e:
+        # Re-raise ValueError to be handled by caller
+        raise
+    except (TypeError, KeyError) as e:
+        raise ValueError(f"Invalid request body format: {str(e)}")
+    except Exception as e:
+        # Catch-all for any other unexpected errors
+        raise ValueError(f"Unexpected error validating request body: {str(e)}")
 
 @app.route(route="knowledgeAgent")
 async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
@@ -820,13 +811,14 @@ async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
 
     except ValueError as e:
         return create_error_response(str(e), 400)
-
+    except ValidationError as e:
+        return create_error_response(f"Validation error: {str(e)}", 400)
     except CustomException as e:
-        return create_error_response(
-            str(e), e.error_code, e.error_code, e.action_field
-        )
-
+        return create_error_response(str(e), e.error_code, e.error_code, e.action_field)
+    except (TypeError, KeyError) as e:
+        return create_error_response(f"Data format error: {str(e)}", 400)
     except Exception as e:
+        # Log the exception here as it's the final catch-all
         logger.exception(
             f"Unexpected error in knowledgeAgent: {str(e)}",
             extra={
@@ -834,6 +826,4 @@ async def knowledgeAgent(req: func.HttpRequest) -> func.HttpResponse:
                 "action_field": "MainCall"
             }
         )
-        return create_error_response(
-            f"An unexpected error occurred: {str(e)}", 500
-        )
+        return create_error_response(f"An unexpected error occurred: {str(e)}", 500)
